@@ -12,6 +12,10 @@ using System.Text.RegularExpressions;
 using Microsoft.CSharp;
 using System.CodeDom.Compiler;
 using System.Reflection;
+using System.Text;
+using System.Threading.Tasks;
+using System.Text.Json;
+using RestSharp;
 
 namespace WpfChatBot
 {
@@ -65,54 +69,81 @@ namespace WpfChatBot
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
         }
 
-        private void SendButton_Click(object sender, RoutedEventArgs e)
+        private async void SendButton_Click(object sender, RoutedEventArgs e)
         {
             if (string.IsNullOrEmpty(InputText))
                 return;
 
+            // Store user input and clear the input field
+            string userInput = InputText;
+            InputText = string.Empty;
+
             // Add user message to chat
             ChatMessages.Add(new ChatMessage
             {
-                Content = InputText,
+                Content = userInput,
                 IsFromUser = true,
-                Timestamp = DateTime.Now
+                Timestamp = DateTime.Now,
+                Role = "user"
             });
 
-            // Get response
-            string response = GetBotResponse(InputText);
-            
-            // Check if response contains code
-            if (ContainsCode(response))
+            // Show loading indicator
+            IsBusy = true;
+
+            try
             {
-                // Extract code
-                string extractedCode = ExtractCode(response);
-                
-                // Add bot message to chat with code component
+                // Get response asynchronously
+                string response = await GetBotResponse(userInput);
+
+                // Check if response contains code
+                if (ContainsCode(response))
+                {
+                    // Extract code
+                    string extractedCode = ExtractCode(response);
+
+                    // Add bot message to chat with code component
+                    ChatMessages.Add(new ChatMessage
+                    {
+                        Content = response.Replace(extractedCode, ""),
+                        IsFromUser = false,
+                        Timestamp = DateTime.Now,
+                        ContainsCode = true,
+                        Code = extractedCode,
+                        Role = "assistant"
+                    });
+                }
+                else
+                {
+                    // Add regular bot message to chat
+                    ChatMessages.Add(new ChatMessage
+                    {
+                        Content = response,
+                        IsFromUser = false,
+                        Timestamp = DateTime.Now,
+                        Role = "assistant"
+                    });
+                }
+            }
+            catch (Exception ex)
+            {
+                // Add error message to chat
                 ChatMessages.Add(new ChatMessage
                 {
-                    Content = response.Replace(extractedCode, ""),
+                    Content = $"Error: {ex.Message}",
                     IsFromUser = false,
                     Timestamp = DateTime.Now,
-                    ContainsCode = true,
-                    Code = extractedCode
+                    IsError = true,
+                    Role = "system"
                 });
             }
-            else
+            finally
             {
-                // Add regular bot message to chat
-                ChatMessages.Add(new ChatMessage
-                {
-                    Content = response,
-                    IsFromUser = false,
-                    Timestamp = DateTime.Now
-                });
-            }
+                // Hide loading indicator
+                IsBusy = false;
 
-            // Clear input
-            InputText = string.Empty;
-            
-            // Scroll to bottom of chat
-            chatScrollViewer.ScrollToBottom();
+                // Scroll to bottom of chat
+                chatScrollViewer.ScrollToBottom();
+            }
         }
 
         private bool ContainsCode(string text)
@@ -126,31 +157,99 @@ namespace WpfChatBot
             // Extract code between markers
             var regex = new Regex(@"```(?:csharp|cs)?\s*([\s\S]*?)\s*```");
             var match = regex.Match(text);
-            
+
             if (match.Success)
             {
                 return match.Groups[1].Value.Trim();
             }
-            
+
             return string.Empty;
         }
 
-        private string GetBotResponse(string userInput)
+        private async Task<string> GetBotResponse(string userInput)
         {
-            // Simple response logic - in a real app, this would connect to an AI service
-            userInput = userInput.ToLower();
-            
-            if (userInput.Contains("hello") || userInput.Contains("hi"))
+            try
             {
-                return "Hello! How can I help you today?";
+                // Create chat history including current user input
+                var messages = new List<ChatMessage>();
+
+                // Add previous context if needed (optional - can be expanded)
+                // You could add the last few messages from ChatMessages collection here
+
+                // Add current user input
+                messages.Add(new ChatMessage { Role = "user", Content = userInput });
+
+                // Connect to Ollama API
+                var options = new RestClientOptions("http://localhost:11434")
+                {
+                    // Increase timeout for longer responses
+                    Timeout = TimeSpan.FromMinutes(2)
+                };
+
+                var client = new RestClient(options);
+                var request = new RestRequest("/api/chat", Method.Post);
+                request.AddHeader("Content-Type", "application/json");
+
+                // Create request body with formatted messages
+                var requestBody = new OllamaRequest
+                {
+                    Model = "llama3.2",
+                    Messages = messages.Select(m => new MessageRequest
+                    {
+                        Role = m.Role,
+                        Content = m.Content
+                    }).ToList(),
+                    // Add stream flag to properly handle streaming responses
+                    Stream = true
+                };
+
+                // Serialize request body
+                request.AddJsonBody(requestBody);
+
+                // Execute request but handle the streaming response properly
+                var fullResponse = new StringBuilder();
+
+                // Use stream handling for proper token accumulation
+                using (var response = await client.DownloadStreamAsync(request))
+                {
+                    using (var reader = new StreamReader(response))
+                    {
+                        string line;
+                        while ((line = await reader.ReadLineAsync()) != null)
+                        {
+                            // Skip empty lines
+                            if (string.IsNullOrWhiteSpace(line))
+                                continue;
+
+                            try
+                            {
+                                // Parse each chunk as a separate JSON object
+                                var chunk = JsonSerializer.Deserialize<OllamaResponse>(line);
+
+                                if (chunk != null && chunk.message != null)
+                                {
+                                    // Append this chunk to our full response
+                                    fullResponse.Append(chunk.message.content);
+
+                                    // If this is the final chunk, we're done
+                                    if (chunk.done)
+                                        break;
+                                }
+                            }
+                            catch (JsonException)
+                            {
+                                // If we got invalid JSON, just skip this chunk
+                                continue;
+                            }
+                        }
+                    }
+                }
+
+                return fullResponse.ToString();
             }
-            else if (userInput.Contains("code") || userInput.Contains("example"))
+            catch (Exception ex)
             {
-                return "Here's a simple example of a 'Hello World' program in C#:\n\n```csharp\nusing System;\n\nclass Program\n{\n    static void Main()\n    {\n        Console.WriteLine(\"Hello, World!\");\n    }\n}\n```";
-            }
-            else
-            {
-                return "I'm not sure how to respond to that. Can you try asking something else?";
+                return $"Error connecting to the LLM service: {ex.Message}";
             }
         }
 
@@ -158,7 +257,7 @@ namespace WpfChatBot
         {
             var button = sender as Button;
             var chatMessage = button.DataContext as ChatMessage;
-            
+
             if (chatMessage != null)
             {
                 chatMessage.IsEditingCode = true;
@@ -169,7 +268,7 @@ namespace WpfChatBot
         {
             var button = sender as Button;
             var chatMessage = button.DataContext as ChatMessage;
-            
+
             if (chatMessage != null)
             {
                 chatMessage.IsEditingCode = false;
@@ -180,14 +279,14 @@ namespace WpfChatBot
         {
             var button = sender as Button;
             var chatMessage = button.DataContext as ChatMessage;
-            
+
             if (chatMessage != null && !string.IsNullOrEmpty(chatMessage.Code))
             {
                 try
                 {
                     // Execute C# code
                     string result = CompileAndExecuteCode(chatMessage.Code);
-                    
+
                     // Display result
                     ChatMessages.Add(new ChatMessage
                     {
@@ -196,7 +295,7 @@ namespace WpfChatBot
                         Timestamp = DateTime.Now,
                         IsExecutionResult = true
                     });
-                    
+
                     // Scroll to bottom of chat
                     chatScrollViewer.ScrollToBottom();
                 }
@@ -211,7 +310,7 @@ namespace WpfChatBot
                         IsExecutionResult = true,
                         IsError = true
                     });
-                    
+
                     // Scroll to bottom of chat
                     chatScrollViewer.ScrollToBottom();
                 }
@@ -227,11 +326,11 @@ namespace WpfChatBot
                 GenerateInMemory = true,
                 GenerateExecutable = false
             };
-            
+
             // Add basic references
             parameters.ReferencedAssemblies.Add("System.dll");
             parameters.ReferencedAssemblies.Add("System.Core.dll");
-            
+
             // Wrap the code in a class with a Main method if it doesn't already have one
             if (!code.Contains("static void Main"))
             {
@@ -251,7 +350,7 @@ public class CodeExecutor
 
             // Compile
             var results = codeProvider.CompileAssemblyFromSource(parameters, code);
-            
+
             if (results.Errors.Count > 0)
             {
                 // Join error messages
@@ -261,14 +360,14 @@ public class CodeExecutor
             // Create a new instance of StringWriter to capture the console output
             var consoleOutput = new StringWriter();
             Console.SetOut(consoleOutput);
-            
+
             try
             {
                 // Execute the compiled assembly
                 var assembly = results.CompiledAssembly;
                 var entryPoint = assembly.EntryPoint;
                 entryPoint.Invoke(null, null);
-                
+
                 // Get the output
                 return consoleOutput.ToString();
             }
@@ -290,6 +389,7 @@ public class CodeExecutor
         }
     }
 
+    // Class for chat messages in UI
     public class ChatMessage : INotifyPropertyChanged
     {
         private string _content;
@@ -300,6 +400,7 @@ public class CodeExecutor
         private bool _isEditingCode;
         private bool _isExecutionResult;
         private bool _isError;
+        private string _role;
 
         public event PropertyChangedEventHandler PropertyChanged;
 
@@ -383,9 +484,47 @@ public class CodeExecutor
             }
         }
 
+        public string Role
+        {
+            get { return _role; }
+            set
+            {
+                _role = value;
+                OnPropertyChanged("Role");
+            }
+        }
+
         private void OnPropertyChanged(string propertyName)
         {
             PropertyChanged?.Invoke(this, new PropertyChangedEventArgs(propertyName));
         }
+    }
+
+    // Classes for Llama API communication
+    public class MessageRequest
+    {
+        public string Role { get; set; }
+        public string Content { get; set; }
+    }
+
+    public class OllamaRequest
+    {
+        public string Model { get; set; }
+        public List<MessageRequest> Messages { get; set; }
+        public bool Stream { get; set; } = true;
+    }
+
+    public class MessageResponse
+    {
+        public string role { get; set; }
+        public string content { get; set; }
+    }
+
+    public class OllamaResponse
+    {
+        public MessageResponse message { get; set; }
+        public string model { get; set; }
+        public DateTime created_at { get; set; }
+        public bool done { get; set; }
     }
 }
